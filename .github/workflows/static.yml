@@ -1,18 +1,16 @@
-name: MTA GTFS Pipeline
+name: MTA GTFS Static
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
     - cron: "0 4 * * *"
   workflow_dispatch:
 
 jobs:
-  run:
+  static:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        mode: [realtime, static]
-
+    concurrency:
+      group: mta-rtf-static-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -21,6 +19,9 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
+          cache: "pip"
+          cache-dependency-path: |
+            dlt_mta_rtf/requirements.txt
 
       - name: Setup venv and install deps
         run: |
@@ -35,17 +36,12 @@ jobs:
         env:
           GCP_SA_KEY_JSON: ${{ secrets.GCP_SA_KEY_JSON }}
 
-      - name: Run pipeline
+      - name: Run static pipeline
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
-          CLOUDSDK_CORE_PROJECT: ${{ secrets.GCP_PROJECT_ID }}
+          CLOUDSDK_CORE_PROJECT: ${{ secrets.GCP_PROJECT_ID || secrets.gcp_project_id }}
           SOURCES__MTA_GTFS_STATIC__ZIP_URL: ${{ secrets.SOURCES__MTA_GTFS_STATIC__ZIP_URL }}
-          PIPELINE_FEEDS: ${{ secrets.PIPELINE_FEEDS }}
         run: |
           set -euo pipefail
           source .venv/bin/activate
-          if [ "${{ matrix.mode }}" = "static" ]; then
-            python -c "from dlt_mta_rtf import load_mta_pipeline as p; p.run(full_static=True)"
-          else
-            python -c "import os; from dlt_mta_rtf import load_mta_pipeline as p; feeds=os.environ.get('PIPELINE_FEEDS'); feeds=feeds.split(',') if feeds else None; p.run(full_static=False, feeds=feeds)"
-          fi
+          python -c "from dlt_mta_rtf import load_mta_pipeline as p; p.run(full_static=True)"
