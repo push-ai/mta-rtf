@@ -89,38 +89,75 @@ window_local AS (
 SELECT * FROM window_local;
 ```
 
-## Helper: actual trips observed (by terminal)
+## Helper: trips observed (time series)
 
-We identify actual trips by taking the earliest `stop_time_update` in each `trip_update` for the trip/date and using its arrival/departure as the start. Depending on how dlt mapped the nested fields, you will either access them as STRUCTs or JSON. Example below assumes nested STRUCTs; adjust to `JSON_VALUE`/`JSON_QUERY` if your columns are STRING JSON.
+Counts distinct trips present in each time bucket using flattened GTFS‑RT columns. Uniqueness is `trip_id + start_date`. Bucketing uses the feed epoch `trip_update__timestamp`.
 
 ```sql
--- Earliest observed stop_time_update per trip on the service date
-WITH rt AS (
+-- Time series of trips observed per minute (flattened schema)
+SELECT
+  tu.feed,
+  tu.trip_update__trip__route_id AS route_id,
+  tu.trip_update__trip__direction_id AS direction_id,
+  TIMESTAMP_TRUNC(
+    TIMESTAMP_SECONDS(SAFE_CAST(tu.trip_update__timestamp AS INT64)),
+    MINUTE
+  ) AS ts_minute,
+  COUNT(DISTINCT CONCAT(tu.trip_update__trip__trip_id, '|', tu.trip_update__trip__start_date)) AS trips_observed
+FROM `push-ai-internal.mta_subway.trip_updates` AS tu
+WHERE tu.trip_update__trip__schedule_relationship IN ('SCHEDULED', 'ADDED')
+  AND TIMESTAMP_SECONDS(SAFE_CAST(tu.trip_update__timestamp AS INT64))
+      BETWEEN @start_ts AND @end_ts
+GROUP BY 1,2,3,4
+ORDER BY ts_minute, feed, route_id, direction_id;
+```
+
+5‑minute bucketing (align to 5‑minute polling cadence):
+
+```sql
+TIMESTAMP_SECONDS(300 * DIV(SAFE_CAST(tu.trip_update__timestamp AS INT64), 300))
+```
+
+Forward‑fill between polls (for charts):
+
+```sql
+-- Trips observed per 5‑min with forward‑fill
+WITH obs AS (
   SELECT
-    tu.feed,
-    tu.as_of,
-    tu.trip_update.trip.trip_id AS trip_id,
-    tu.trip_update.trip.route_id AS route_id,
-    tu.trip_update.stop_time_update AS stu  -- ARRAY<STRUCT<...>>
+    tu.trip_update__trip__route_id AS route_id,
+    tu.trip_update__trip__direction_id AS direction_id,
+    TIMESTAMP_SECONDS(300 * DIV(SAFE_CAST(tu.trip_update__timestamp AS INT64), 300)) AS ts_5min,
+    COUNT(DISTINCT CONCAT(tu.trip_update__trip__trip_id, '|', tu.trip_update__trip__start_date)) AS trips_observed
   FROM `push-ai-internal.mta_subway.trip_updates` tu
-  WHERE DATE(tu.as_of, 'America/New_York') = DATE('2025-09-01')
+  WHERE tu.trip_update__trip__schedule_relationship IN ('SCHEDULED', 'ADDED')
+    AND TIMESTAMP_SECONDS(SAFE_CAST(tu.trip_update__timestamp AS INT64)) BETWEEN @start_ts AND @end_ts
+  GROUP BY route_id, direction_id, ts_5min
 ),
-first_event AS (
-  SELECT
-    route_id,
-    trip_id,
-    (SELECT AS STRUCT s.* FROM UNNEST(stu) s ORDER BY s.stop_sequence LIMIT 1) AS first_stu,
-    MIN(as_of) AS first_seen
-  FROM rt
-  GROUP BY route_id, trip_id, stu
+keys AS (
+  SELECT DISTINCT route_id, direction_id FROM obs
+),
+spine AS (
+  SELECT bucket_ts
+  FROM UNNEST(GENERATE_TIMESTAMP_ARRAY(@start_ts, @end_ts, INTERVAL 5 MINUTE)) AS bucket_ts
+),
+sparse AS (
+  SELECT k.route_id, k.direction_id, s.bucket_ts AS ts_5min, o.trips_observed
+  FROM keys k
+  CROSS JOIN spine s
+  LEFT JOIN obs o
+    ON o.route_id = k.route_id AND o.direction_id = k.direction_id AND o.ts_5min = s.bucket_ts
 )
 SELECT
   route_id,
-  trip_id,
-  first_stu.stop_id AS terminal_stop_id,
-  COALESCE(first_stu.departure.time, first_stu.arrival.time) AS first_epoch_seconds,
-  TIMESTAMP_MILLIS(COALESCE(first_stu.departure.time, first_stu.arrival.time) * 1000) AS actual_departure_ts
-FROM first_event;
+  direction_id,
+  ts_5min,
+  LAST_VALUE(trips_observed IGNORE NULLS) OVER (
+    PARTITION BY route_id, direction_id
+    ORDER BY ts_5min
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS trips_observed_ff
+FROM sparse
+ORDER BY ts_5min, route_id, direction_id;
 ```
 
 If the `trip_update` column is stored as STRING JSON, extract via:
@@ -149,36 +186,45 @@ Query pattern
 3) Join on `trip_id` and aggregate by `route_id`, `direction_id`.
 
 ```sql
--- Assume window_local (scheduled) from helper and actual_first (actuals) as:
-WITH actual_first AS (
-  SELECT DISTINCT
-    route_id,
-    trip_id,
-    -- Convert epoch seconds to local time window and filter
-    TIMESTAMP_MILLIS(COALESCE(stu.departure.time, stu.arrival.time) * 1000) AS actual_departure_ts
-  FROM (
-    SELECT
-      tu.trip_update.trip.route_id AS route_id,
-      tu.trip_update.trip.trip_id AS trip_id,
-      (SELECT AS STRUCT s.* FROM UNNEST(tu.trip_update.stop_time_update) s ORDER BY s.stop_sequence LIMIT 1) AS stu
-    FROM `push-ai-internal.mta_subway.trip_updates` tu
-    WHERE DATE(tu.as_of, 'America/New_York') = DATE('2025-09-01')
-  )
+-- Assume window_local (scheduled) from helper above.
+-- Actual terminal departures from flattened GTFS‑RT tables
+WITH first_event AS (
+  SELECT
+    tu.trip_update__trip__route_id     AS route_id,
+    tu.trip_update__trip__direction_id AS direction_id,
+    tu.trip_update__trip__trip_id      AS trip_id,
+    ARRAY_AGG(
+      STRUCT(
+        COALESCE(SAFE_CAST(stu.departure__time AS INT64), SAFE_CAST(stu.arrival__time AS INT64)) AS event_epoch,
+        stu.stop_sequence AS stop_sequence
+      )
+      ORDER BY stop_sequence ASC
+      LIMIT 1
+    )[OFFSET(0)] AS first_stu
+  FROM `push-ai-internal.mta_subway.trip_updates` tu
+  JOIN `push-ai-internal.mta_subway.trip_updates__trip_update__stop_time_update` stu
+    ON stu._dlt_parent_id = tu._dlt_id
+  WHERE DATE(tu.as_of, 'America/New_York') = DATE('2025-09-01')
+  GROUP BY route_id, direction_id, trip_id
 ),
 actual_in_window AS (
-  SELECT route_id, trip_id
-  FROM actual_first
-  WHERE TIME(FORMAT_TIMESTAMP('%T', actual_departure_ts, 'America/New_York'))
+  SELECT
+    route_id,
+    direction_id,
+    trip_id
+  FROM first_event
+  WHERE first_stu.event_epoch IS NOT NULL
+    AND TIME(FORMAT_TIMESTAMP('%T', TIMESTAMP_SECONDS(first_stu.event_epoch), 'America/New_York'))
         BETWEEN '06:00:00' AND '10:00:00'
 )
 SELECT
   s.route_id,
   s.direction_id,
-  COUNT(DISTINCT s.trip_id)                       AS scheduled_trips,
-  COUNT(DISTINCT a.trip_id)                       AS delivered_trips,
+  COUNT(DISTINCT s.trip_id) AS scheduled_trips,
+  COUNT(DISTINCT a.trip_id) AS delivered_trips,
   SAFE_DIVIDE(COUNT(DISTINCT a.trip_id), COUNT(DISTINCT s.trip_id)) AS service_delivered
 FROM window_local s
-LEFT JOIN actual_in_window a USING (route_id, trip_id)
+LEFT JOIN actual_in_window a USING (route_id, direction_id, trip_id)
 GROUP BY s.route_id, s.direction_id
 ORDER BY s.route_id, s.direction_id;
 ```
@@ -195,7 +241,7 @@ Concepts
 - Additional Wait Time (AWT_excess): observed_AWT − scheduled_AWT.
 - Wait Assessment: % of observed headways within tolerance vs schedule (e.g., ≤ 2× scheduled headway, or within ±x seconds).
 
-Observed headways via `vehicle_positions` example
+Observed headways via `vehicle_positions` example (flattened, time series)
 
 ```sql
 -- Choose a screenline stop_id and direction
@@ -204,14 +250,14 @@ DECLARE tz STRING DEFAULT 'America/New_York';
 
 WITH seen AS (
   SELECT
-    TIMESTAMP_TRUNC(TIMESTAMP_MILLIS(vehicle.timestamp * 1000), SECOND) AS ts,
-    vehicle.trip.route_id AS route_id,
-    vehicle.trip.trip_id  AS trip_id,
-    vehicle.stop_id       AS stop_id,
-    vehicle.current_status AS status
+    TIMESTAMP_TRUNC(TIMESTAMP_SECONDS(SAFE_CAST(vehicle__timestamp AS INT64)), SECOND) AS ts,
+    vehicle__trip__route_id AS route_id,
+    vehicle__trip__trip_id  AS trip_id,
+    vehicle__stop_id        AS stop_id,
+    vehicle__current_status AS status
   FROM `push-ai-internal.mta_subway.vehicle_positions`
-  WHERE vehicle.stop_id = screenline_stop_id
-    AND DATE(TIMESTAMP_MILLIS(vehicle.timestamp * 1000), tz) = DATE('2025-09-01')
+  WHERE vehicle__stop_id = screenline_stop_id
+    AND DATE(TIMESTAMP_SECONDS(SAFE_CAST(vehicle__timestamp AS INT64)), tz) = DATE('2025-09-01')
 ),
 ordered AS (
   SELECT *, ROW_NUMBER() OVER (ORDER BY ts) AS rn
@@ -284,34 +330,67 @@ Query pattern
 
 ```sql
 WITH sched AS (... window_local ...),
-actual AS (... actual_in_window with actual_departure_ts ...)
+actual AS (
+  -- First terminal event per trip from flattened RT tables
+  WITH first_event AS (
+    SELECT
+      tu.trip_update__trip__route_id     AS route_id,
+      tu.trip_update__trip__direction_id AS direction_id,
+      tu.trip_update__trip__trip_id      AS trip_id,
+      ARRAY_AGG(
+        STRUCT(
+          COALESCE(SAFE_CAST(stu.departure__time AS INT64), SAFE_CAST(stu.arrival__time AS INT64)) AS event_epoch,
+          stu.stop_sequence AS stop_sequence
+        )
+        ORDER BY stop_sequence ASC
+        LIMIT 1
+      )[OFFSET(0)] AS first_stu
+    FROM `push-ai-internal.mta_subway.trip_updates` tu
+    JOIN `push-ai-internal.mta_subway.trip_updates__trip_update__stop_time_update` stu
+      ON stu._dlt_parent_id = tu._dlt_id
+    WHERE DATE(tu.as_of, 'America/New_York') = DATE('2025-09-01')
+    GROUP BY route_id, direction_id, trip_id
+  )
+  SELECT
+    route_id,
+    direction_id,
+    trip_id,
+    TIMESTAMP_SECONDS(first_stu.event_epoch) AS actual_departure_ts
+  FROM first_event
+  WHERE first_stu.event_epoch IS NOT NULL
+)
 SELECT
   s.route_id,
   s.direction_id,
   COUNT(*) AS trips,
   100 * AVG(CASE WHEN TIMESTAMP_DIFF(a.actual_departure_ts, s.sched_departure_ts, MINUTE) BETWEEN 0 AND 5 THEN 1 ELSE 0 END) AS otp_pct
 FROM sched s
-LEFT JOIN actual a USING (route_id, trip_id)
+LEFT JOIN actual a USING (route_id, direction_id, trip_id)
 GROUP BY s.route_id, s.direction_id
 ORDER BY s.route_id, s.direction_id;
 ```
 
 ## Metric 4: Disruption/Alert counts and durations
 
-Alerts (cause/effect) over time by route.
+Alerts over time by route (flattened/informed_entity join)
 
 ```sql
+-- Time series of alert counts by route (per minute)
+WITH alert_routes AS (
+  SELECT
+    TIMESTAMP_TRUNC(a.as_of, MINUTE) AS ts_minute,
+    ie.trip__route_id AS route_id
+  FROM `push-ai-internal.mta_subway.alerts` a
+  LEFT JOIN `push-ai-internal.mta_subway.alerts__alert__informed_entity` ie
+    ON ie._dlt_parent_id = a._dlt_id
+)
 SELECT
-  a.as_of,
-  eff.text AS effect,
-  cause.text AS cause,
-  r
-FROM `push-ai-internal.mta_subway.alerts` a,
-UNNEST(a.alert.effect) eff,
-UNNEST(a.alert.cause) cause
--- Adjust to your actual STRUCT path; if stored as JSON use JSON_VALUE/JSON_QUERY
-ORDER BY a.as_of DESC
-LIMIT 100;
+  ts_minute,
+  route_id,
+  COUNT(*) AS alerts_observed
+FROM alert_routes
+GROUP BY ts_minute, route_id
+ORDER BY ts_minute, route_id;
 ```
 
 ## Practical guidance
