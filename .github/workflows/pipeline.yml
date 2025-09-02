@@ -2,8 +2,8 @@ name: MTA GTFS Pipeline
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
-    - cron: '0 4 * * *'
+    - cron: "*/5 * * * *"
+    - cron: "0 4 * * *"
   workflow_dispatch:
 
 jobs:
@@ -20,7 +20,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.10"
 
       - name: Setup venv and install deps
         run: |
@@ -45,16 +45,7 @@ jobs:
           set -euo pipefail
           source .venv/bin/activate
           if [ "${{ matrix.mode }}" = "static" ]; then
-            python - <<'PY'
-from dlt_mta_rtf import load_mta_pipeline as p
-p.run(full_static=True)
-PY
+            python -c "from dlt_mta_rtf import load_mta_pipeline as p; p.run(full_static=True)"
           else
-            python - <<'PY'
-import os
-from dlt_mta_rtf import load_mta_pipeline as p
-feeds_env = os.environ.get('PIPELINE_FEEDS')
-feeds = feeds_env.split(',') if feeds_env else None
-p.run(full_static=False, feeds=feeds)
-PY
+            python -c "import os; from dlt_mta_rtf import load_mta_pipeline as p; feeds=os.environ.get('PIPELINE_FEEDS'); feeds=feeds.split(',') if feeds else None; p.run(full_static=False, feeds=feeds)"
           fi
