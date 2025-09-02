@@ -2,8 +2,8 @@ from typing import Optional
 
 import dlt
 
-from mta_gtfs_realtime import mta_rt_source
-from mta_gtfs_static import mta_static_source
+from dlt_mta_rtf.mta_gtfs_realtime import mta_rt_source
+from dlt_mta_rtf.mta_gtfs_static import mta_static_source
 
 
 def run(full_static: bool = False, feeds: Optional[list[str]] = None) -> None:
