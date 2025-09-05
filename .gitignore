@@ -1,0 +1,3 @@
+# Ignore only local dlt secrets file; keep other config tracked
+dlt_mta_rtf/.dlt/secrets.toml
+

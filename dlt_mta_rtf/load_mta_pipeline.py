@@ -1,4 +1,5 @@
 from typing import Optional
+import os
 
 import dlt
 
@@ -7,10 +8,15 @@ from dlt_mta_rtf.mta_gtfs_static import mta_static_source
 
 
 def run(full_static: bool = False, feeds: Optional[list[str]] = None) -> None:
+    # Default to a dev dataset locally; allow override via env; keep CI using prod dataset
+    default_dataset = os.environ.get("DLT_DATASET_NAME")
+    if not default_dataset:
+        default_dataset = "mta_subway" if os.environ.get("GITHUB_ACTIONS") else "mta_subway_dev"
+
     pipeline = dlt.pipeline(
         pipeline_name="mta_subway",
         destination="bigquery",
-        dataset_name="mta_subway",
+        dataset_name=default_dataset,
     )
 
     # Load static GTFS reference tables for names/labels
