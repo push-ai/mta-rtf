@@ -1,2 +1,0 @@
-dlt[bigquery]>=1.15.0
-gtfs-realtime-bindings>=1.0.0
